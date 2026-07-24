@@ -513,10 +513,17 @@ If the user offers a lesson:
   <hostname>]` (adds the API-server serving-cert SAN). Sequence: write static
   netplan + k3s config → reboot → `kubectl get nodes -o wide` shows the new
   InternalIP → **delete the gateway (Kong) and twin-service pods** (they crash on
-  the IP change; recover from local images) → wait Ready. Caveat: if the IEM base
-  URL / IED-onboarding was pinned to the OLD address, the UI/onboarding may still
-  point there even once pods run — onboard the IED against the new IP, or make its
-  FQDN resolve to the new IP on the offline net. (iem-stellantis.)
+  the IP change; recover from local images) → wait Ready. ⚠ **The IEM binds to the
+  IP it was ACTIVATED/onboarded with** — the portal base URL, keycloak issuer and
+  each IED's onboarding record all expect that address. So the target IP is NOT a
+  free choice: return the IEM to its **activation IP**, and never re-onboard IEDs
+  against a different one. (In iem-stellantis the VM was activated on `…179.28`; a
+  temporary DHCP address was only used to get internet for the image re-pull, and
+  moving back to `.28` restores the IEM's real identity so UI/onboarding line up —
+  there's no stale-address mismatch to fix. If you genuinely must change the IEM's
+  IP, that's an activation/DNS problem, not just a netplan one: keep a hostname that
+  resolves to the activation address, or expect to re-activate/re-onboard.)
+  (iem-stellantis.)
 - [2026-07] **Two UI-exposure redirect modes** (`FromBoxReverseProxy` vs
   `FromBoxSpecificPort`) added as a section. Reverse-proxy = NO `ports:`, needs
   `nginxjson`, app must be prefix-aware, gets IED TLS+login for free; direct-port =
@@ -552,3 +559,16 @@ If the user offers a lesson:
   `COPY`s `app/config`/`app/data` ships real IPs/credentials to the customer — use a
   `.dockerignore` that keeps only an `init.example.json` template (also speeds builds
   by dropping `build/`/`node_modules/`/`.git/`). (compose cheatsheet digest.)
+
+- [2026-07] **Make a k3s IEM VM portable across hosts — pin the NIC name.** netplan
+  and k3s `flannel-iface` both reference the interface by literal name (`ens33`). Copy
+  the VM to another host/hypervisor and the NIC may enumerate differently (`ens160`,
+  `eth0`, …), which strands the VM (netplan finds no `ens33` → no IP) AND re-crash-loops
+  k3s (`flannel-iface: ens33` now points at a nonexistent iface — offline there's no
+  default route for flannel to fall back on). Fix: in netplan use `match: {name: "en*"}`
+  + `set-name: ens33`, so whatever single ethernet NIC appears is renamed to `ens33` and
+  both the static IP and `flannel-iface` stay valid anywhere. Match by **name-glob, not
+  MAC** (a VMware "I Copied It" regenerates the MAC). Verify with a reboot: NIC comes up
+  `ens33`, k3s `NRestarts` stays 0. Keep the activation IP unchanged (the IEM is bound to
+  it); don't run the original and the copy on one network simultaneously (IP/identity
+  clash). (iem-stellantis, Hugo, Mekatronik.)
