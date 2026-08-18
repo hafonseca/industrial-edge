@@ -358,6 +358,45 @@ subscription as strategic flexibility against tech obsolescence vs. sunk CAPEX):
   embedded Python interpreter — deploy models as app *content*, no per-model custom
   container.
 
+### Recovering the IEM Pro initial admin password (`iem_user`) after deploy
+
+`ieprovision install` prints the initial admin credentials **once**, to STDOUT, at
+the end of the install. Losing that output does **not** mean redeploying the IEM —
+the password lives in a Kubernetes Secret in the `iem` namespace and can be read
+back at any time:
+
+```bash
+kubectl get secret keycloak-secret -n iem \
+  -o jsonpath="{.data.INITIALUSER_PASSWORD}" | base64 -d; echo
+```
+
+Equivalent with go-template (use this when the key has characters `jsonpath`
+chokes on, e.g. dots or dashes inside the key name):
+
+```bash
+kubectl get secret keycloak-secret -n iem \
+  -o go-template='{{index .data "INITIALUSER_PASSWORD" | base64decode}}{{"\n"}}'
+```
+
+**`jsonpath` syntax traps** (both fail *loudly* but also dump the whole Secret):
+- `{data.INITIALUSER_PASSWORD}` (no leading dot) → `unrecognized identifier data`.
+  The leading `.` is mandatory — without it the parser reads `data` as a bare
+  identifier, not a field of the root object.
+- `{data[INITIALUSER_PASSWORD]}` → `invalid array index`. Brackets mean *array
+  index* in kubectl's jsonpath; they do **not** work as a map-key accessor with a
+  bare word. (Quoted form `{.data['INITIALUSER_PASSWORD']}` does work, but prefer
+  the dot form or go-template.)
+
+⚠ **Both malformed variants print the entire Secret object to the terminal** —
+every Keycloak client secret plus `CUSTOMER_ADMIN_PASSWORD` and
+`INITIALADMIN_PASSWORD`. Base64 is *encoding, not encryption*: anything on that
+screen is plaintext to anyone who reads it. If such output was photographed,
+screenshotted, pasted into a chat/ticket, or otherwise left the environment,
+treat it as a credential disclosure: **rotate** the affected passwords/client
+secrets, then clear the local trail (`history -c`, wipe the terminal scrollback,
+and delete any saved log). Same reasoning applies to storing the password in a
+plaintext file next to the deployment artifacts — keep it out of git.
+
 **Homologation / "software dependencies?" questions:** all IE apps are
 self-contained Docker containers → **no external host deps** (Java/.NET/Visual
 C++/Acrobat). Only prerequisites are a supported OS + the K8s/Docker infra IE
@@ -387,10 +426,71 @@ lessons from every project that loads it.
 
 If the user offers a lesson:
 1. Confirm it's genuinely IE-general (not app-specific).
-2. Add it to the relevant section above, or to the **Lessons learned** log below
+2. **Pull before you write** — follow the *Sync with GitHub* protocol below.
+3. Add it to the relevant section above, or to the **Lessons learned** log below
    with a short date + context so future sessions can trust it.
-3. Keep entries terse and normative. Prefer editing the rules directly when a
+4. Keep entries terse and normative. Prefer editing the rules directly when a
    lesson is a firm rule; use the log when it's a nuance/observation.
+5. **Commit and push** — again per the protocol below. An enrichment that only
+   exists in the working tree is invisible to every other project and machine.
+
+### Sync with GitHub (do this around every enrichment)
+
+This skill is checked out as a git repo and installed as a **symlink** into
+`~/.claude/skills/`, so the file being edited *is* the repo working tree — and it
+is shared. Other people (or the same user on another machine) push lessons to the
+same `main`. Treat the remote as the source of truth and never let a local
+enrichment silently clobber someone else's.
+
+**Protocol — every time a lesson is about to be written:**
+
+1. **Sync first.** From the skill's repo root:
+   ```bash
+   git status --porcelain && git fetch origin && \
+     git rev-list --left-right --count origin/main...HEAD
+   ```
+   The counts read `<behind> <ahead>`.
+2. **Behind, clean tree** → `git pull --ff-only origin main`, then **re-read the
+   sections you were about to edit**. Upstream may already cover the lesson, or
+   cover it differently.
+3. **Behind, dirty tree / already ahead** → do *not* force anything. Fetch, then
+   diff the incoming changes against the pending edit:
+   ```bash
+   git diff HEAD origin/main -- SKILL.md
+   ```
+4. **Divergence check.** If upstream touched the same rule, section, or lesson —
+   especially if it states something that **contradicts** what is about to be
+   written — stop and ask the user with **AskUserQuestion**. Do not pick a winner
+   unilaterally: a contradicting upstream entry usually means someone hit the same
+   problem on different firmware/hardware, and both facts may be true under
+   different conditions. Frame the question with the *concrete* two versions, e.g.:
+
+   > "Upstream `main` now says X about `<topic>`; the lesson we're about to record
+   >  says Y. How should I resolve this?"
+   >
+   > - **Keep upstream, drop ours** — theirs is newer/more authoritative.
+   > - **Keep ours, supersede upstream** — ours is the corrected finding; I'll edit
+   >   the upstream entry and note what changed and why.
+   > - **Record both, scoped** — they're both true under different conditions
+   >   (firmware, IED version, hardware); I'll keep each with its qualifying context.
+   > - **Let me look first** — show me the full upstream diff before deciding.
+
+   When "record both" is chosen, always write the *distinguishing condition* into
+   each entry ("on IED 1.21 with …"), otherwise the log becomes self-contradictory.
+5. **Then write, commit, push.** Conventional message: one line summarizing the
+   lesson (`Record IEM activation-IP binding + portable-NIC lessons`), body optional.
+   ```bash
+   git add -A && git commit -m "<summary>" && git push origin main
+   ```
+6. **Push rejected (non-fast-forward)** → someone pushed between the fetch and the
+   push. Re-run from step 1 against the new `origin/main`; **never** `push --force`
+   this repo — a force-push destroys other projects' recorded lessons.
+7. If pushing fails for auth/network reasons, say so plainly and leave the commit
+   in place — do not silently drop the enrichment.
+
+**Also sync opportunistically at load:** if the skill loads and `git fetch` shows
+it is behind, mention it and offer to pull, so the session runs against the
+current knowledge base rather than a stale copy.
 
 ### Lessons learned (append-only log)
 
@@ -572,3 +672,17 @@ If the user offers a lesson:
   `ens33`, k3s `NRestarts` stays 0. Keep the activation IP unchanged (the IEM is bound to
   it); don't run the original and the copy on one network simultaneously (IP/identity
   clash). (iem-stellantis, Hugo, Mekatronik.)
+
+- [2026-07] **The IEM Pro admin password is recoverable — don't redeploy to get it
+  back.** `ieprovision install` prints `iem_user`'s password only to STDOUT at the
+  end, but it persists in the `keycloak-secret` Secret in ns `iem`:
+  `kubectl get secret keycloak-secret -n iem -o jsonpath="{.data.INITIALUSER_PASSWORD}"
+  | base64 -d`. Two jsonpath traps: omitting the leading dot (`{data.…}`) →
+  `unrecognized identifier data`; brackets with a bare word (`{data[…]}`) →
+  `invalid array index` (brackets = array index, not map key). Both malformed
+  forms **dump the whole Secret** — all Keycloak client secrets plus
+  `CUSTOMER_ADMIN_PASSWORD`/`INITIALADMIN_PASSWORD` — in base64, which is encoding,
+  not encryption. If that output leaves the environment (photo, screenshot, paste),
+  rotate the credentials and clear shell history/scrollback. go-template form is
+  the safer alternative for awkward key names. See the new *Recovering the IEM Pro
+  initial admin password* subsection. (Hugo, Mekatronik.)
