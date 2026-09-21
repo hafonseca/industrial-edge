@@ -411,6 +411,216 @@ they mean build+version+publish automation (plausible) vs. cloud-style continuou
 deployment / immutable infra / instant rollback (not how IE works) — surface the
 mismatch early so scope doesn't drift into an imagined "industrial Azure DevOps".
 
+### Automating publish and rollout with `iectl` (verified on iectl 2.19.8, 09/2026)
+
+Everything below is scriptable; the house implementation lives in
+`mk-data-bridge/deploy/` (`release.sh`, `upload-iem.sh`, `upload-iehub.sh`) with
+`docs/devops-iectl.md`. Source: Siemens manual "Industrial Edge Platform Operation:
+APIs & References" v26.09 (tutorials *Application Pipeline*, *Manage IEM Jobs*,
+*Upload App on the IE Hub*), flags re-checked against the binary's `--help`.
+
+**Pin the application id, or every machine publishes a different app.** The `.app`
+carries a 32-hex `applicationId` that the publisher generates per workspace, and the
+workspace is local/gitignored. Same name + different id = a *new* app in the IEM,
+which the IED installs from scratch (new volumes, orphaned config). Keep a versioned
+registry of ids per app/variant and pass it on create:
+`iectl publisher standalone-app create --appId <32 hex>` (capital **I**: the
+publisher plugin is Node/commander and case-sensitive; `--appid` is silently not
+that flag). Generate new ids with `openssl rand -hex 16`; recover an existing one
+from the IEM with `iectl iem device-apps app-details --app-name <name>`
+(`.applicationId`). Never change a pinned id of an app that is already on an IEM.
+
+**Two ways to hand the image to the publisher.** Default is the Docker Engine API
+on `tcp://127.0.0.1:2375` (`config add publisher --dockerurl`), which is root
+without auth. The alternative needs no TCP at all: `docker save img:tag -o x.tar`
+and `version create ... --imagetarjson '{"<service>":"x.tar"}'`; then
+`config add publisher` takes only `--name --workspace`. That is the CI-runner path.
+`--changelogs` wants literal `\n` for line breaks. Re-running `version create` on an
+existing version fails; delete it first in the workspace (`version delete`) to make
+a script idempotent. The exported file is named `<appId>_<version>.app`.
+
+**Level 1, straight into an IEM** (`iectl config add iem --name --url --user
+--password-stdin`; `IE_SKIP_CERTIFICATE=true` / `EDGE_SKIP_TLS=1` for self-signed):
+
+| step | command | trap |
+|---|---|---|
+| upload | `iectl iem device-apps upload --app-file-path X --follow` | needs IEM helm >= 1.15.5; older IEMs: `iectl iem catalog import-application --app-file-path X --follow` |
+| ids | `iectl iem device-apps app-details --app-name N` | `.applicationId`, `.versions[].versionId` |
+| devices | `iectl iem device list --size 1000` | **default page size is 5**; without `--size` the device is simply missing |
+| installed? | `iectl iem device list-apps --deviceid ID` | decides `installApplication` vs `updateApplication` |
+| rollout | `iectl iem job batch-create --appid A --versionId V --operation installApplication --infoMap '{"devices":["id1","id2"]}'` | one batch per app, N devices; returns the batch id in `.data` |
+| wait | `job batch-status --batchId B` until `PROCESSED`, `job list --id B` (**`--id`, not `--batchId`**) for `installedJobId`s, `job device-job-wait --id J --timeout S` | the wait returns at timeout even if the job is not done: read the output |
+
+**`iem` vs `iem-v2`.** In iectl 2.19 the whole `iectl iem` group is marked
+*deprecated* and `iectl iem-v2` (IE Management V2) coexists with it. V2 differences:
+`device-apps import --file X` (no `--follow`; wait with `job import-job-wait --id`),
+details only by `--applicationId` (so the pinned id matters; name lookup is
+`device-apps list --filter "name contains '...'"`), an extra
+`device-apps publish --applicationId --versionId` before installing, no
+`device list-apps` (use `device details --device-id`), `job get-batch-jobs --id`
+instead of `job list`. Which group applies depends on the target IEM's generation,
+not on the iectl version: ask, don't assume.
+
+**Level 2, through the IEHub** (tenant-scoped; needs an **API user**, see below):
+
+```
+iectl config add iehub --name X --url https://iehub.eu1.edge.siemens.cloud --user <email> --password-stdin   # URL without the hub name
+iectl iehub product-management create --product-name N --icon-path icon.png     # once per app
+iectl iehub product-management version create --product-name N --version 1.2.0  # major.minor.patch+meta <= 32 chars
+iectl iehub product-management version upload --app-binary X.app --product-name N --version 1.2.0
+iectl iehub product-management version private-release --product-name N --version 1.2.0
+iectl iehub library copy-product --product-name N --iem-name <IEM instance>      # one per IEM of the tenant
+```
+*Private* release makes the version visible only in the tenant's Library, no
+Siemens review; *public* release (Marketplace) goes through Siemens. So level 2
+only reaches IEMs that live in **your** IEHub tenant (e.g. an IEM Pro you host for a
+customer); a customer IEM in the customer's own tenant is level 1 or Marketplace.
+Whether an IEM that already copied the product picks up later versions by itself
+or needs another `copy-product` is not documented; treat as unverified and copy
+every time (the copy is asynchronous and can fail silently, see the sync-pod note
+above). Installing on the IEDs from there is still a batch job on the IEM.
+
+**IEHub API access is not the portal login.** The portal uses the Siemens ID
+(SSO, MFA); `iectl` needs a *CLI/API password* generated in the IEHub UI: top-right
+menu → **API access management** → **+ Grant API Access**, which shows the
+password once. `--user` is the same e-mail as the Siemens ID; the account must be a
+member of the tenant with rights on the products (product management) and, for
+`iehub run-ied-dev`, "device builder" access. `iectl iehub token fetch` returns a
+token that can be exported as `IEHUB_TOKEN` to skip re-authentication per command.
+`iectl` itself is downloaded from the IEHub (Download Software → Developer Tools →
+Industrial Edge Control Linux/Windows); the zip holds just the binary, the `.7z`
+next to it is only the OSS disclosure HTML.
+
+**Manifests.** `iectl apply --manifest x.yaml` chains commands with variables and
+JSONPath references to earlier outputs (`appid:
+"iem.catalog.list#{.data[?(@.title=='app')].applicationId}"`), an alternative to
+bash for the same pipelines.
+
+**Compatibility gates:** iectl >= 2.10.1 needs IEM helm >= 1.8.1 (image
+compression in the `.app`); iectl >= 2.7.1 cannot talk to IED-OS <= 1.12.0-10.
+
+---
+
+## Physical recovery of an IPC Edge Device (no UI, no IEM)
+
+**There is no physical factory reset.** The IE **Hard Reset** — which removes the
+device from the IEM and deletes apps, user data, certificates, the jwt-auth file
+and proxy data — is software-only: IEM Management UI, or the device's own UI
+(`Settings > System > Hard Reset`). No button, jumper or key combo triggers it.
+
+What the hardware offers is only a **hard reboot**: hold the power button
+**> 10 s** (IPC operating instructions: RAM data is lost, disk data *may* be lost,
+"perform a hardware reset only in the case of an emergency").
+
+**BX-59A quirk:** a hard reset/reboot can fail leaving **3 LEDs red**. Fix: hold
+`<Esc>` while powering on to enter the BIOS, set `Power > XHCI USB Wake
+Capability > xHCI Mode = disabled`, then retry the reset/reboot.
+
+**Wait before you wipe.** Two documented IED-OS behaviours look exactly like a
+dead device:
+- After a power cut or forced shutdown the OS runs a **filesystem recovery that
+  takes 2–3 h** (release-note known issue). Leave it powered on that long before
+  concluding it is bricked.
+- Stuck in the boot phase after a firmware update → power-cycle manually; the
+  device comes back on the **previous firmware** (A/B slots), then retrigger the
+  update.
+
+### The Service Stick is the only supported repair
+
+If the OS cannot boot, Siemens is categorical: deploy the OS artifact via the
+**SIMATIC IPC Industrial Edge Service Stick**. "Any other way is not supported and
+will cause the device to lose its authenticity and therefore the device will not be
+supported in the Edge Ecosystem."
+
+Anatomy (verified by opening `simatic-ipc-ied-ss-3.0-x86-64.zip`, 08/2026): the SIOS
+zip ships **both halves already paired** —
+- `simatic-ipc-ied-ss-3.0.0-6-x86-64.wic.gz` — the stick image. GPT layout is
+  `data` (FAT32, 6.4 GB) + `ESP` (87 MB); 6.53 GB raw, so a **≥ 8 GB** USB. Burn
+  with Rufus in **DD mode** or `dd ... bs=4M oflag=direct`.
+- `simatic-ipc-ied-os-3.0.0-51-x86-64.swu` — the firmware itself. Copy **exactly
+  one** `.swu` into the `data` partition, eject safely, replug and re-verify its
+  SHA-256 (ejecting without safe-removal corrupts it).
+
+On the device: monitor + keyboard attached, USB boot enabled (BIOS `SCU > Boot`) →
+Boot Manager → the USB → **"Wipe Data & Reinstall"** → Yes → `Enter` →
+`Power Management > Reboot`. Never unplug the stick or cut power mid-install.
+
+⚠ **USB boot is OFF by default on the IPC — enabling it is a mandatory step, not a
+check.** Straight out of the box (confirmed in the field on a BX-59A, 08/2026) the
+device simply does not list the stick in the Boot Manager, which reads exactly like
+"the stick is broken" and sends people off re-burning a perfectly good USB. Enter
+the BIOS (hold `<Esc>` at power-on), go to `SCU > Boot`, enable USB boot, save with
+`F10`, and only then expect the stick to appear. The
+same stick also **collects device logs** (needs ≥ 2 GB free) — do that *before*
+wiping, since the logs are what any SR will ask for.
+
+⚠ **The stick pins an OS version — check for a silent downgrade.** The 3.0 stick
+installs `3.0.0-51`; a device running e.g. `3.2.0-17` gets rolled back two minor
+versions (re-update from the IEM afterwards). Prefer the stick whose `.swu` matches
+the installed version when SIOS offers one.
+
+⚠ **Don't reuse the old `ies-os-*.img` medium on modern devices.**
+`ies-os-1.1.1-12-amd64.img` is the previous-generation **"Industrial Edge Service
+Medium"** (Siemens Industrial OS 2.1.1 buster, kernel 4.19, 2021; Debian package
+`service-installer` = "Industrial Edge Service Media"). It works completely
+differently from the Service Stick: it mounts the device's `efiboota`/`efibootb`
+partitions, backs up `system.efi`/`BGENV.DAT`/`EFILABEL` per device serial onto its
+own `SERVICE` partition, copies `system.hardreset.efi` over the device kernel,
+disables the watchdog (`bg_setenv -w 0`, EFI Boot Guard) and reboots — so menu item
+**2 (restore system files) is mandatory** after item 1, otherwise the device stays
+on the reset kernel. Its bundled kernels are `ied-os-1.2.0-57` (hard reset) and
+`ied-os-1.0.0-48` (delivery, menu 8, gated to IE 1.0). On a BX-59A that is a
+version mismatch that can cost you *both* boot slots. It is still useful as a
+**bootable diagnostic shell**: menu item 3 drops to bash — `lsblk -o
+NAME,SIZE,PARTLABEL,LABEL,FSTYPE`, mount the device root, `cat /etc/os-release`.
+
+### Device/OS naming to keep straight
+
+`SIMATIC IPC AI IE Device-OS v1.0` (BX-59A only, 08/2024) was **merged into IE
+Device-OS V3.0** (`simatic-ipc-ied-os-3.0.0-51`, 03/2025) — there is no separate
+"AI" OS line any more, and older docs that say otherwise are stale. V3.0 supports
+127E / 227E / 427E / 847E / 227G / BX-39A / BX-59A; **V3.1.1 and later support only
+the BX-59A** (MLFB `6AG4133-0DE40-0WN0`: i9-13900E, NVIDIA L4, 32 GB DDR5, 1 TB
+NVMe). Latest seen: `3.2.0-17` (06/2026, IEDK 1.26.4, Debian 12 / kernel 6.1).
+
+### BX-59A LED map (4 LEDs: Power / Run / Error / Maintenance)
+
+| State | Power | Run | Error | Maint. |
+|---|---|---|---|---|
+| Hard reset succeeded (device no longer in IEM) | green | green flashing | – | – |
+| Not connected to the IEM | green | green flashing | – | – |
+| Connecting to IEM (USB config file inserted) | green | green flashing | – | orange flashing |
+| Connected to the IEM | green | green | – | – |
+| Connection to the IEM failed | green | – | red flashing | – |
+| IED-OS update in progress | green | – | – | orange flashing |
+| Shut down | orange | – | – | – |
+
+Re-onboarding after a reinstall needs no browser: put **one** Edge Device
+configuration file (generated in the IEM) on a USB stick and insert it — the
+process starts automatically and writes `conf-usb.log` / `services.log` back to the
+stick for diagnosis.
+
+### Reading the Siemens docs portal programmatically
+
+`docs.industrial-operations-x.siemens.cloud` is a Fluid Topics SPA: plain HTTP
+fetches return an empty shell, so search engines and fetch tools see nothing. The
+public REST API works and is by far the fastest way to mine it:
+`GET /api/khub/maps` (every manual + its id) → `GET /api/khub/maps/{mapId}/toc`
+(topic tree with `contentId` and prettyUrl) → `GET
+/api/khub/maps/{mapId}/topics/{contentId}/content` (the topic HTML). There is no
+exposed search endpoint — walk the TOC and filter titles.
+
+### Getting Siemens to move on a problem (SR etiquette)
+
+The **Support Request is the vehicle**, always. Product owners and account contacts
+will help, but they escalate *into* the SR — the Chlorum case (Jan 2026) is the
+template: the PO's first answer was "explain the issue, mention the system
+information, and upload the logs via our support platform ... from there, customer
+requests are handled with highest priority and a dedicated contact". After every
+finding on your side, **update the SR too**, not only the e-mail thread — the
+escalation stalls when support sees unanswered follow-up questions. Keep the SR
+number in every message.
+
 ---
 
 ## Enrich this skill (do this every time it loads)
@@ -488,9 +698,27 @@ enrichment silently clobber someone else's.
 7. If pushing fails for auth/network reasons, say so plainly and leave the commit
    in place — do not silently drop the enrichment.
 
-**Also sync opportunistically at load:** if the skill loads and `git fetch` shows
-it is behind, mention it and offer to pull, so the session runs against the
-current knowledge base rather than a stale copy.
+**At load, ask before syncing — never sync automatically.** Fetching on every
+load is noise: most sessions just read the skill and never write to it. So when
+the skill loads, do *not* run `git fetch`. Instead ask once, up front, with
+**AskUserQuestion**:
+
+> "Sync the `industrial-edge` skill with GitHub before we start?"
+>
+> - **Skip sync (recommended)** — use the local copy as-is; faster, and fine for
+>   read-only use.
+> - **Fetch and pull if behind** — run the sync protocol above so the session runs
+>   against the current shared knowledge base.
+
+Rules:
+- Ask **at most once per session**, and only for the load-time check. If the user
+  skips, don't ask again mid-session.
+- A skip only covers *reading*. If the session later goes to **write** a lesson,
+  the sync protocol above still runs in full (steps 1–7) — pulling before writing
+  is mandatory regardless of the load-time answer.
+- Don't ask at all if the skill is loaded for a quick lookup inside a larger task
+  where a prompt would derail the user; just use the local copy and sync at
+  enrichment time.
 
 ### Lessons learned (append-only log)
 
@@ -686,3 +914,71 @@ current knowledge base rather than a stale copy.
   rotate the credentials and clear shell history/scrollback. go-template form is
   the safer alternative for awkward key names. See the new *Recovering the IEM Pro
   initial admin password* subsection. (Hugo, Mekatronik.)
+
+- [2026-08] **Physical recovery of a corrupted BX-59A** (MK830 / M Dias, Hugo,
+  Mekatronik). Device stopped booting after the plant's air-conditioning failed
+  (suspected thermal event), with no UI and not connected to any IEM. Findings, now
+  captured in the *Physical recovery* section: the IE Hard Reset is software-only
+  (IEM UI or device UI) — there is no reset button/jumper; the power button held
+  > 10 s is only a hard reboot; a failed BX-59A reset showing 3 red LEDs is fixed by
+  disabling xHCI Mode under `Power > XHCI USB Wake Capability` in the BIOS (`<Esc>`
+  at power-on); and a device that "won't boot" after a power cut may simply be in
+  the documented 2–3 h filesystem recovery. Only the Service Stick may reinstall the
+  OS — anything else voids the device's authenticity in the Edge Ecosystem.
+
+- [2026-08] **Service Stick zip ships the stick image AND the matching `.swu`.**
+  Opened `simatic-ipc-ied-ss-3.0-x86-64.zip` (SHA-256 verified against SIOS):
+  `*-ss-3.0.0-6-x86-64.wic.gz` (GPT: `data` FAT32 6.4 GB + `ESP`; 6.53 GB raw → ≥ 8 GB
+  USB) plus `*-ied-os-3.0.0-51-x86-64.swu` (1.07 GB), i.e. the version pairing is
+  pre-decided by Siemens — no need to hunt the `.swu` separately. Corollary trap: the
+  stick **pins** that OS version, so reinstalling on a device running a newer build
+  (the M Dias unit reported `3.2.0-17`) is a two-minor-version **downgrade**; plan the
+  re-update from the IEM afterwards, or get the matching stick.
+
+- [2026-08] **`ies-os-*.img` is the old "Industrial Edge Service Medium", not a
+  Service Stick.** Reverse-engineered `ies-os-1.1.1-12-amd64.img` (Industrial OS 2.1.1
+  buster, 2021): it swaps `system.hardreset.efi` into the device's `efiboota`/`efibootb`
+  partitions via EFI Boot Guard and requires the follow-up "restore" menu item, and its
+  payload kernels are `ied-os-1.0.0-48` / `1.2.0-57`. Do not point it at a BX-59A; use
+  it only as a bootable diagnostic shell. Details in the *Physical recovery* section.
+
+- [2026-08] **Mine the Siemens docs portal through the Fluid Topics REST API.**
+  `docs.industrial-operations-x.siemens.cloud` renders nothing to a plain fetch, which
+  is why answers about IE hardware are so hard to find. `/api/khub/maps` →
+  `/api/khub/maps/{id}/toc` → `/api/khub/maps/{id}/topics/{contentId}/content` returns
+  the full manual text. This is how the BX-59A hard-reset, LED-status, Service Stick and
+  release-note facts above were sourced.
+
+- [2026-01] **IEVD on Hyper-V + IIH S7 connector = IED UI crash (Chlorum, SR
+  1-8083837145).** Activating the S7 connector against a PCS7 made the Edge Device UI
+  crash and stop responding after minutes to hours, surviving a completely fresh,
+  isolated IED instance. Mekatronik isolated it to **hosting the IEVD on Microsoft
+  Hyper-V** — reproduced there, not on VMware/Proxmox, with matching log signatures at
+  the customer. Immediate action was moving the IEVD to VMware while keeping the
+  affected VM intact for analysis. Practical rule: **prefer VMware ESXi/vSphere for
+  IEVD**, and when a connector destabilizes the device UI, suspect the hypervisor
+  before the connector config. See also the SR-etiquette subsection — this case is
+  where that escalation pattern was learned.
+
+- [2026-08] **USB boot is disabled by default on the IPC BIOS — the Service Stick
+  will not even be listed until you turn it on.** Found in the field on the M Dias
+  BX-59A: the Boot Manager showed no USB device, which looks identical to a bad
+  burn. Fix is `<Esc>` at power-on → `SCU > Boot` → enable USB boot → `F10` save.
+  Treat it as a required step of the reinstall procedure (the Siemens manual lists
+  it only as a "requirement", which is easy to skim past), and put it *before* the
+  "re-burn the stick" branch of any field troubleshooting guide. (MK830 / M Dias.)
+
+- [2026-09] **`iectl` automation of publish and rollout, verified on iectl 2.19.8**
+  (mk-data-bridge, Hugo, Mekatronik). New subsection *Automating publish and
+  rollout with `iectl`* under Platform ops. Headlines: pin the 32-hex application
+  id per app/variant in a versioned registry and pass `--appId` (capital I) or every
+  publishing machine creates a different app; `--imagetarjson` with `docker save`
+  removes the Docker-TCP-2375 requirement; level 1 = `iem device-apps upload` +
+  `iem job batch-create --operation installApplication|updateApplication` over N
+  devices; level 2 = `iehub product-management` (create, version create, version
+  upload, private-release) + `iehub library copy-product --iem-name` per IEM of the
+  tenant; IEHub needs an API password from "API access management", not the SSO
+  login. Traps: `iem device list` pages **5** by default; `iem job list` takes
+  `--id`; iectl 2.19 marks the whole `iem` group deprecated next to `iem-v2`. The
+  docs-portal REST API trick above is how the command reference was mined; the old
+  `iectl iem app upload` and `publisher app-project upload catalog` are gone/EOL.
