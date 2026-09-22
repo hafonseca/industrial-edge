@@ -480,6 +480,16 @@ or needs another `copy-product` is not documented; treat as unverified and copy
 every time (the copy is asynchronous and can fail silently, see the sync-pod note
 above). Installing on the IEDs from there is still a batch job on the IEM.
 
+**One app, one tenant. Never release the same app in two IEHub tenants.** Field
+finding (Hugo, Mekatronik, 09/2026, not yet reproduced in a controlled way): releasing
+the same application (same app id / repo name) as a product in a second IEHub tenant
+breaks it in the second tenant. Consequences: (a) the customer's real apps are
+released only in the tenant that owns the IEMs that run them (a customer with its own
+IEHub tenant, like M. Dias Branco, gets its apps released *there*, through an API user
+of that tenant); (b) your own tenant is for **test images only**, never the
+production app; (c) if the same variant must exist in two tenants, give it a
+different pinned app id (and name) per tenant: for the platform they are two apps.
+
 **IEHub API access is not the portal login.** The portal uses the Siemens ID
 (SSO, MFA); `iectl` needs a *CLI/API password* generated in the IEHub UI: top-right
 menu → **API access management** → **+ Grant API Access**, which shows the
@@ -982,3 +992,9 @@ Rules:
   `--id`; iectl 2.19 marks the whole `iem` group deprecated next to `iem-v2`. The
   docs-portal REST API trick above is how the command reference was mined; the old
   `iectl iem app upload` and `publisher app-project upload catalog` are gone/EOL.
+- [2026-09] **Same app released in two IEHub tenants breaks in the second tenant**
+  (reported by Hugo, Mekatronik, from experience; mechanism unknown). Rule now under
+  *Automating publish and rollout*: one app id lives in one tenant; the customer's
+  production apps go through the customer's tenant (their IEM lives there), and the
+  house tenant only ever gets throwaway test apps with their own ids. (MK830 / M. Dias
+  Branco, whose IED is managed by an IEM in MDB's own IEHub tenant.)
