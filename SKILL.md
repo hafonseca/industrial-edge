@@ -471,7 +471,17 @@ iectl iehub product-management version upload --app-binary X.app --product-name 
 iectl iehub product-management version private-release --product-name N --version 1.2.0
 iectl iehub library copy-product --product-name N --iem-name <IEM instance>      # one per IEM of the tenant
 ```
-*Private* release makes the version visible only in the tenant's Library, no
+Three things the manual does not say, all hit on 2026-09-21: **`product-management
+create` is not idempotent** (a second call creates another product with the same
+name, after which every `--product-name` command fails with "more than one product";
+look the product up in `product-management list` first and use `--product-id`);
+the **binary and the icon get an asynchronous virus scan** (~1 min): `private-release`
+before it ends fails with "Version file scan is not completed yet", and `delete` of a
+fresh product fails with "product icon scan is not completed yet" (poll
+`version get-details` → `files[].virusScan.status == COMPLETED`); and the release
+itself is asynchronous: `CREATED` → `PRIVATE_RELEASE_IN_PROGRESS` →
+**`ECOSYSTEM_REVIEWED`**, which is the released state (the version then shows in
+`iehub library list`). *Private* release makes the version visible only in the tenant's Library, no
 Siemens review; *public* release (Marketplace) goes through Siemens. So level 2
 only reaches IEMs that live in **your** IEHub tenant (e.g. an IEM Pro you host for a
 customer); a customer IEM in the customer's own tenant is level 1 or Marketplace.
@@ -1002,3 +1012,9 @@ Rules:
   tenant gets test apps with their own ids, and a variant needed in two tenants is at
   least repackaged per tenant, preferably with its own app id. Whether repackaging
   alone is enough is untested.
+- [2026-09] **IEHub product pipeline, run for real** (test app `MkTesteDevops`,
+  Mekatronik tenant): `product-management create` duplicates on re-run (resolve by
+  `list` + `--product-id`); binary and icon are virus-scanned asynchronously and
+  release/delete fail until the scan completes; release states are `CREATED` →
+  `PRIVATE_RELEASE_IN_PROGRESS` → `ECOSYSTEM_REVIEWED` (= in the tenant Library).
+  Folded into the *Automating publish and rollout* subsection.
