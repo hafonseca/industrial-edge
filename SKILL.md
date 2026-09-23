@@ -645,6 +645,87 @@ number in every message.
 
 ---
 
+## IED device internals — the on-device engine (reverse-engineered from OSS disclosure)
+
+> **Source of truth:** the Siemens-published open-source disclosure bundle for
+> **Industrial Edge Device IPC 1.25** (`1DB-IndustrialEdgeDeviceIPC__1.25.0`,
+> `Industrial Edge Device Kit 1.25.1`, `meta-cake` Debian-12 layer). This is the
+> **device/firmware side** — the layer *below* your app. It exists to explain *why*
+> the app rules above are the way they are. The bundle is **source disclosure only**:
+> no credentials, no `/etc/shadow`, no private keys ship in it (verified).
+
+### The 4 layers of an IED (bottom → top)
+
+1. **Boot & update** — `swupdate 2023.12` + `EFI Boot Guard 0.19` (a **Siemens** OSS project) + `libubootenv`. Dual-slot **A/B** with automatic rollback.
+2. **Base OS** — Debian 12 (bookworm) rootfs assembled by a Yocto/OE layer ("cake"). Container base is `minidebbookworm-rt35` → **PREEMPT_RT (real-time) kernel**. Hardened with AppArmor, `cryptsetup` (LUKS), `audit`, `fail2ban`, `sudo`, `argon2`, `ntpsec`.
+3. **Container runtime** — `containerd` (1.5.2 / 1.6.20) + Docker (v24→v28) + `docker-cli`. Your apps and the EdgeCore services all run as **OCI containers**. NVIDIA `open-gpu-kernel-modules 545` is present → on-device GPU/AI inference.
+4. **EdgeCore platform services** (containers): **Ory Hydra 2.2.0** (OAuth2/OIDC), **PostgreSQL 17.5**, **Redis 7.0.15**, **fluent-bit 3.2.7** + `rsyslog` (logs/telemetry), `openssh` + `fail2ban`, a proxy layer (`connect-proxy`), `gnupg2` (signature verification). The **Device Kit agent** (Go) is the control plane: HashiCorp **Vault** for secrets, **go-plugin** (gRPC) for extensions, **ACME/boulder + go-rootcerts** for **mTLS** to the IEM.
+
+### Boot + update: A/B with automatic rollback
+
+The device never overwrites the slot it is running from. An update is written to the
+**inactive** slot; the bootloader only switches after the new slot is committed, and
+**reverts on its own** if the new slot fails to boot. This is why a bad update cannot
+brick the device — and why a firmware update always needs the *other* slot free.
+
+`swupdate` also speaks the **Docker REST API** directly (`docker_handler.c`:
+`/images/load`, `/containers/create|start|stop`). So platform images **and** app
+containers are delivered through the same signed, transactional pipeline.
+
+### The `.swu` package format + trust chain
+
+- A `.swu` is a **cpio archive (`newc`)**. Order matters: **`sw-description` first**,
+  then **`sw-description.sig`**, then the payload images (streamed, not buffered).
+- `sw-description` (libconfig or JSON) is the manifest: `version`,
+  `hardware-compatibility` (refuses the wrong HW revision), `images` (each with a
+  **sha256**), optional `scripts` (`.lua` / shell pre/post-install), and the A/B
+  `main`/`alt` sets. Because it carries every image's hash, signing the manifest seals
+  the whole package.
+- **"Only signed images can be installed."** Verification is `sha256` +
+  **RSA (PKCS#1 or PSS)**, **CMS/PKCS#7 (X.509 cert chain)**, or **GPG**. IE uses the
+  certificate/CMS path (matches the `gnupg2` + ACME/mTLS stack). Without Siemens'
+  private key you cannot forge a `.swu`.
+
+### EFI Boot Guard on-disk environment (what flips the slot)
+
+Packed struct `BG_ENVDATA` on a FAT config partition, one per slot:
+
+| field | meaning |
+|---|---|
+| `kernelfile` / `kernelparams` | UTF-16, 255 chars each |
+| `in_progress` (u8) | `1` = update in flight, `0` = settled. **Hard-wired in the bootloader** — cannot be disabled. |
+| `ustate` (u8) | `0 OK` · `1 INSTALLED` · `2 TESTING` · `3 FAILED` · `4 UNKNOWN` |
+| `watchdog_timeout_sec` (u16) | watchdog arm time for the trial boot |
+| `revision` (u32) | highest valid revision wins the boot; `0` = FAILED/lowest |
+| `crc32` | integrity of the record |
+
+**State machine:** boots the env with `in_progress==0` and the highest `revision`.
+Install → new slot gets `revision+1`, `ustate=INSTALLED`. First boot → bootloader sets
+`ustate=TESTING` and arms the **watchdog**. If userspace confirms → `ustate=OK` (update
+"blessed"). If the boot hangs → watchdog reboots, sees `TESTING` (never confirmed),
+marks the slot `ustate=FAILED, revision=0`, and the previous slot wins again → **rollback**.
+
+### Identity: there is no root password — by design
+
+Access is **not** a fixed factory password. It is:
+
+- **OAuth2 / OpenID Connect via Ory Hydra** (token-based) for platform/API access,
+- **mTLS** (ACME-issued certs) between the device and the **IEM**,
+- **Vault** for on-device secrets,
+- SSH is present but guarded by **fail2ban**; the supported admin path is the **IEM /
+  Web UI**, not `ssh root@device`.
+
+If you lose access to a device you own, the supported recovery is
+**re-provisioning / factory reset via the IEM**, not credential extraction. (See the
+`iem_user` recovery note above for the *management* side.)
+
+### Practical takeaways for app authors
+
+- Firmware updates need the **inactive A/B slot** free — plan disk/maintenance windows around it.
+- An app image you ship is deployed through the **same Docker-REST path** the platform uses; it is subject to the device's signature/trust posture.
+- The device is **real-time (PREEMPT_RT)** and **AppArmor-confined** — do not assume a container gets free rein; respect the platform's confinement and the RAM `mem_reservation` rules above.
+- There is **no root password to hunt for**; integrate with **OAuth2/OIDC + mTLS**, and treat re-provisioning as the recovery path.
+
 ## Enrich this skill (do this every time it loads)
 
 This skill is a **shared, growing knowledge base** about Industrial Edge, fed by
@@ -1018,3 +1099,4 @@ Rules:
   release/delete fail until the scan completes; release states are `CREATED` →
   `PRIVATE_RELEASE_IN_PROGRESS` → `ECOSYSTEM_REVIEWED` (= in the tenant Library).
   Folded into the *Automating publish and rollout* subsection.
+- [2026-09] IED on-device engine documented from the IPC 1.25 OSS disclosure: swupdate + EFI Boot Guard A/B with auto-rollback, .swu = signed cpio (sw-description first, CMS/X.509), EFI Boot Guard env state machine (in_progress/ustate/revision/watchdog), Ory Hydra OAuth2/OIDC identity + Vault + mTLS - no root password by design. - Funny Shit / OSS audit
