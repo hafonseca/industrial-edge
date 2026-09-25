@@ -429,6 +429,11 @@ publisher plugin is Node/commander and case-sensitive; `--appid` is silently not
 that flag). Generate new ids with `openssl rand -hex 16`; recover an existing one
 from the IEM with `iectl iem device-apps app-details --app-name <name>`
 (`.applicationId`). Never change a pinned id of an app that is already on an IEM.
+**An IEM's ids are not always hex:** apps that came through the IEHub (and some
+older locally-published ones) carry 32-character **base62** ids such as
+`XGZulVRuU5A7TnOvFySJO2yTV7lFhTha`, and `versionId`s are base62 too. Don't validate
+ids with a hex regex, and don't assume `--appId` accepts a base62 id until tested
+(untested as of 2026-09).
 
 **Two ways to hand the image to the publisher.** Default is the Docker Engine API
 on `tcp://127.0.0.1:2375` (`config add publisher --dockerurl`), which is root
@@ -450,6 +455,19 @@ a script idempotent. The exported file is named `<appId>_<version>.app`.
 | installed? | `iectl iem device list-apps --deviceid ID` | decides `installApplication` vs `updateApplication` |
 | rollout | `iectl iem job batch-create --appid A --versionId V --operation installApplication --infoMap '{"devices":["id1","id2"]}'` | one batch per app, N devices; returns the batch id in `.data` |
 | wait | `job batch-status --batchId B` until `PROCESSED`, `job list --id B` (**`--id`, not `--batchId`**) for `installedJobId`s, `job device-job-wait --id J --timeout S` | the wait returns at timeout even if the job is not done: read the output |
+| recon (read-only) | `device get-details --id`, `device get-statistics --id`, `device-logs list --id`, `job device-job-list --pagesize 1000`, `job import-job-list`, `iem-extensions list`, `device-types` | `get-statistics` returns JSON **inside a string**, keyed by epoch-ms; it carries `SystemInfo` (CPU, RAM, uptime), `StorageInfo`, `interface[]` (IPs, DNS), `ntpstatus`, and `AppCount.MemoryUsage` = the sum of the apps' memory limits vs `MemoryCapicity` (sic) |
+| catalog by id | `device-apps app-details --app-id ID` | prefer `--app-id` in loops: `--app-name` breaks on names with spaces or a stray `\r`, and the id is unique |
+
+Verified on a real IEM (M. Dias Branco, 2026-09-25, v1 API): `device list` →
+`data[].deviceId/deviceName/deviceStatus/deviceVersion`; `app-details` →
+`applicationId`, `versions[].versionId/version/creationDate`; `device list-apps` →
+`data[].applicationId/versionNumber/status` plus the field **`verionId`** (typo in
+the API, keep it when parsing); `job device-job-list` → `installedJobId`, `batchId`,
+`operation`, `status`, and `appVersion` holds the **versionId**, not the number.
+`device-apps upload --follow` prints the job as `{"data":"<jobId>"}` then polls to
+`COMPLETED` / "Application Imported Successfully". A device's `status` in the IEM
+(`ACTIVE`) says nothing about liveness: check the timestamp of the last
+`get-statistics` snapshot (a dead BX-59A stayed `ACTIVE` for six weeks).
 
 **`iem` vs `iem-v2`.** In iectl 2.19 the whole `iectl iem` group is marked
 *deprecated* and `iectl iem-v2` (IE Management V2) coexists with it. V2 differences:
@@ -501,6 +519,10 @@ owns the IEMs running them (a customer with its own tenant gets them released *t
 through an API user of that tenant); the house tenant gets **test apps with their own
 ids**, never the production `.app`; and if one variant must exist in two tenants,
 repackage per tenant at minimum, and prefer a distinct pinned app id per tenant.
+**The trigger is in the IEHub, not in the `.app` itself:** the very same file that was
+released in the house tenant later imported cleanly by *direct* `iem device-apps
+upload` into the customer's IEM (2026-09-25), with app id and `versionId` untouched.
+Level 1 is therefore the safe way to get a house-built `.app` onto a customer IEM.
 
 **IEHub API access is not the portal login.** The portal uses the Siemens ID
 (SSO, MFA); `iectl` needs a *CLI/API password* generated in the IEHub UI: top-right
@@ -511,7 +533,12 @@ member of the tenant with rights on the products (product management) and, for
 token that can be exported as `IEHUB_TOKEN` to skip re-authentication per command.
 `iectl` itself is downloaded from the IEHub (Download Software → Developer Tools →
 Industrial Edge Control Linux/Windows); the zip holds just the binary, the `.7z`
-next to it is only the OSS disclosure HTML.
+next to it is only the OSS disclosure HTML. `iectl --version` does not exist, but
+`iectl version` does (`Release Version: Win-v2.19.8`, build hash, build time). The
+Windows build (`iectl.exe`, 176 MB, same build hash as Linux) runs the same bash
+scripts unchanged under Git Bash: drop it in a PATH dir as `iectl.exe` and `command -v
+iectl` resolves it. Only the image-tar generation needs Docker; uploading and
+installing a prebuilt `.app` does not.
 
 **Manifests.** `iectl apply --manifest x.yaml` chains commands with variables and
 JSONPath references to earlier outputs (`appid:
@@ -1099,4 +1126,15 @@ Rules:
   release/delete fail until the scan completes; release states are `CREATED` →
   `PRIVATE_RELEASE_IN_PROGRESS` → `ECOSYSTEM_REVIEWED` (= in the tenant Library).
   Folded into the *Automating publish and rollout* subsection.
+- [2026-09] **Level 1 run for real against a customer IEM** (M. Dias Branco,
+  `mk-data-bridge`, Hugo, Mekatronik, 2026-09-25): v1 API JSON shapes confirmed and
+  written into the level-1 table (`verionId` typo, `appVersion` = versionId); IEM app
+  ids can be **base62**, not only hex; the same `.app` that breaks a second IEHub
+  tenant imports fine by direct IEM upload; `iectl version` exists and the Windows
+  binary runs the bash tooling under Git Bash; read-only recon commands
+  (`get-statistics`, `device-job-list`, `iem-extensions list`, `device-types`) give a
+  full production snapshot without touching a device, and a device's `ACTIVE` status
+  is not liveness. Also seen: an IEVD type declares `maxInstalledAppCount: 20` /
+  `maxRunningAppCount: 10` while the device runs 21 apps, so those limits are
+  metadata, not enforced (at least on `ievd-1.26`).
 - [2026-09] IED on-device engine documented from the IPC 1.25 OSS disclosure: swupdate + EFI Boot Guard A/B with auto-rollback, .swu = signed cpio (sw-description first, CMS/X.509), EFI Boot Guard env state machine (in_progress/ustate/revision/watchdog), Ory Hydra OAuth2/OIDC identity + Vault + mTLS - no root password by design. - Funny Shit / OSS audit
