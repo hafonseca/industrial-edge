@@ -455,6 +455,53 @@ IEM host for the duration of the window only**, and keep the list as plan B. On 
 segregated plant network, the person holding SSH on the IEM host is usually the critical
 path: book them, or get SSH delegated, before booking the window.
 
+**Field run, 16/10/2026** (MK830 / M. Dias Branco, IEM Pro on a single-node k3s
+`v1.33.5`, Ubuntu 24.04, VMware VM; installed with `ieprovision` in 11/2025, release
+`ie6e5a`, chart `application-management-service-v1.15.9`, revision 1). Done in three
+`helm` steps, about 20 min of upgrade time in total:
+
+| step | how | time | what was seen |
+|---|---|---|---|
+| 1.15.9 → 1.15.20 | `ieprovision upgrade -n iem --chart iehub/application-management-service:v1.15.20` | ~7 min | jobs `db-migration`, `gateway-pre/post-upgrade-migrations`, `keycloak-upgrade-script`; `auth-service` restarted 4x and `onpremisedevicetypemanagement` 1x before settling; `iess-s3-statefulset` 5/5 → 4/4 (the `iam` container is gone, by design) |
+| 1.15.20 → 2.2.1 | the documented `helm upgrade ... iehubv2/ie-management --version v2.2.1 --reset-then-reuse-values` | ~6 min | new pods (`audit-service-0`), `postgres-0` restarted once, `twin-service` a few restarts; UI (i) menu then shows Version 2.2.1 |
+| 2.2.1 → 2.3.2 | same command, `--version v2.3.2` | | plain V2 to V2 update |
+
+Lessons from that run:
+- **Pre-flight that proved enough** (read-only): `helm list -A` (chart = real
+  version), `helm repo list`, `kubectl get pods -A`, `df -h /`, and three curls whose
+  *healthy* answers look like errors: `repo.portal.../public-v2/index.yaml` → **200**,
+  `cr.eu1.edge.siemens.cloud/v2/` → **401**, the starport S3 bucket root → **403**.
+  A `regsecgen` job that went `Completed` minutes after the firewall change is another
+  sign egress works.
+- **`ieprovision list-charts` refreshes the expired `iehub` repo password** (valid
+  12 h) and lists every V1 version, so you can pick the last V1 patch (1.15.20 here)
+  instead of the bare minimum. Patch steps inside 1.15 are not blocked by its
+  one-minor-at-a-time rule.
+- **Release 2.3.2 existed, but the migration guide names 2.2.1.** We migrated to the
+  documented 2.2.1 and only then did a normal V2 update to 2.3.2; the 2.3.2 notes say
+  nothing about coming straight from V1.
+- **`ieprovision upgrade` prints nothing until `Helm release upgraded`.** Watch
+  `kubectl get pods -n iem --sort-by=.metadata.creationTimestamp` and `helm history
+  <release> -n iem` (`pending-upgrade` / `Preparing upgrade`) instead, and never
+  Ctrl+C: an interrupted client leaves the release stuck in `pending-upgrade`. Run the
+  upgrade inside `tmux` when the shell comes through a PAM web session (senhasegura
+  here) that can time out.
+- **The V2 chart NOTES print the Keycloak admin credentials in clear text on every
+  `helm upgrade`, not only on install** (`KEYCLOAK_USER`/`_PASSWORD` for `iem_user`,
+  `KEYCLOAK_CUSTOMER_REALM_ADMIN`/`_PASSWORD` for `customer_admin`). It is a read of
+  `keycloak-secret`, **not a reset**: the customer admin password was unchanged. But
+  anyone watching a shared or recorded session sees them; plan who is on screen, or
+  rotate afterwards if policy requires.
+- **The IEM's k3s may host other workloads.** This one also ran the customer's
+  production TimescaleDB, Grafana and CloudBeaver (namespace `production`, exposed via
+  k3s `svclb-*`). The Velero recipe in the docs scales down **all** statefulsets, which
+  would take that database down: restrict anything you scale to `-n iem`. A
+  `pg_dumpall` of `postgres-0` in `iem` is a backup that stops nothing.
+- **Configurator releases are separate Helm releases** (`IEDBC-3.2.3`,
+  `common-configurator-1.1.0` here) and the V1-to-V2 upgrade does not touch them; their
+  move is the separate "Migration from configurators to Management Applications"
+  topic.
+
 ### Automating publish and rollout with `iectl` (verified on iectl 2.19.8, 09/2026)
 
 Everything below is scriptable; the house implementation lives in
@@ -1187,3 +1234,9 @@ Rules:
   `ie-management` v2.2.1 with `--reset-then-reuse-values`, Keycloak backup for rollback,
   `iectl iem-v2` afterwards, and the official IEM to IE Hub / Siemens ID domain list with
   the by-name / no-SSL-bumping caveats. New subsection *Migrating IEM Pro V1 to V2*.
+- [2026-10] **First real IEM Pro V1-to-V2 run** (MK830 / M. Dias Branco, Hugo,
+  Mekatronik, 16/10/2026): 1.15.9 → 1.15.20 (`ieprovision`) → 2.2.1 → 2.3.2 (`helm`),
+  ~7 + ~6 min. Recorded the pre-flight whose healthy answers are 200/401/403, that
+  `ieprovision list-charts` renews the repo password, that the V2 NOTES print the
+  Keycloak admin passwords on every upgrade (a read, not a reset), and that the Velero
+  recipe would stop non-IEM workloads living on the same k3s.
