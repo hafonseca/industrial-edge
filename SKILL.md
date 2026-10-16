@@ -411,6 +411,50 @@ they mean build+version+publish automation (plausible) vs. cloud-style continuou
 deployment / immutable infra / instant rollback (not how IE works) — surface the
 mismatch early so scope doesn't drift into an imagined "industrial Azure DevOps".
 
+### Migrating IEM Pro V1 to V2 and opening its internet egress
+
+Source: Siemens manual *Setup, Operate & Utilize*, topics "Migrate IE Management Pro V1
+to V2" (Prerequisites, Migration risks, Procedure) and "Contacted domain names" (read
+10/2026 through the docs REST API below; chart version current as of release 06/26).
+
+- **Prerequisite: V1 must be >= 1.15.17.** An older V1 (e.g. 1.15.9) first needs an
+  update inside V1, then the migration: plan both steps into the same window.
+- **It is an in-place Helm upgrade**, guide written for **IEM Pro** (Kubernetes). IEM
+  Virtual is a different path: confirm which flavor before promising a window.
+  ```bash
+  helm repo add iehubv2 https://repo.portal.eu1.edge.siemens.cloud/public-v2
+  helm repo update iehubv2
+  helm list -n <namespace>          # V1 chart is application-management-service
+  helm upgrade $RELEASE_NAME iehubv2/ie-management --version="v2.2.1" \
+    --timeout 30m0s -n <namespace> --reset-then-reuse-values
+  ```
+  `--reset-then-reuse-values` is mandatory (chart defaults reset, your overrides
+  reapplied). The 30 min timeout covers pulling the V2 images and the migration jobs.
+  The **legacy group migration runs automatically** during the upgrade.
+- **Back up the Keycloak database first** (own DB backup or a Velero backup of the IEM
+  namespace). Restoring it is part of the documented V2 to V1 rollback; without it there
+  is no clean rollback.
+- **After migrating, tooling changes:** the IEM now answers `iectl iem-v2`, not
+  `iectl iem` (see the `iem` vs `iem-v2` note below), so release scripts pinned to v1
+  must switch.
+- **What V2 adds that matters for access governance** (official V1 vs V2 comparison):
+  Role Templates for app/version sharing (successor of *My User Groups*) and Device
+  Groups with role delegation (replacing *My Admin Groups*).
+
+**Egress the IEM needs (all TCP 443 outbound).** IEM to IE Hub: `portal`, `portalhub`,
+`portal-relay`, `artifacts`, `oss`, `applications`, `products`, `cr`, `iehub`,
+`repo.portal` (Helm charts), `license`, all under `.eu1.edge.siemens.cloud`, plus
+`prod-eu-central-1-starport-layer-bucket.s3.eu-central-1.amazonaws.com` (AWS ECR
+layers, not adjustable). Siemens ID login: `siemens-00035.eu.auth0.com`,
+`login.siemens.com`, `cdn.login.siemens.com`, `cdn.auth0.com`, `cdn.eu.auth0.com`. China
+uses `*.cn1.edge.cloud-siemens.cn` instead. Siemens' own caveats: **allowlist by name, never
+by resolved IP** (dynamic IPs), **disable SSL bumping / TLS interception** on any proxy, and
+the host must resolve these names in DNS. In practice the list tends to miss some registry
+endpoint, so when the customer's security allows it, ask for **full outbound 443 from the
+IEM host for the duration of the window only**, and keep the list as plan B. On a
+segregated plant network, the person holding SSH on the IEM host is usually the critical
+path: book them, or get SSH delegated, before booking the window.
+
 ### Automating publish and rollout with `iectl` (verified on iectl 2.19.8, 09/2026)
 
 Everything below is scriptable; the house implementation lives in
@@ -1138,3 +1182,8 @@ Rules:
   `maxRunningAppCount: 10` while the device runs 21 apps, so those limits are
   metadata, not enforced (at least on `ievd-1.26`).
 - [2026-09] IED on-device engine documented from the IPC 1.25 OSS disclosure: swupdate + EFI Boot Guard A/B with auto-rollback, .swu = signed cpio (sw-description first, CMS/X.509), EFI Boot Guard env state machine (in_progress/ustate/revision/watchdog), Ory Hydra OAuth2/OIDC identity + Vault + mTLS - no root password by design. - Funny Shit / OSS audit
+- [2026-10] **IEM Pro V1 to V2 migration + IEM egress allowlist** (MK830 / M. Dias Branco,
+  Hugo, Mekatronik): V1 >= 1.15.17 prerequisite, in-place `helm upgrade` to
+  `ie-management` v2.2.1 with `--reset-then-reuse-values`, Keycloak backup for rollback,
+  `iectl iem-v2` afterwards, and the official IEM to IE Hub / Siemens ID domain list with
+  the by-name / no-SSL-bumping caveats. New subsection *Migrating IEM Pro V1 to V2*.
